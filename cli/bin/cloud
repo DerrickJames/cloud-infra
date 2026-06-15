@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="Cloud"
+
+#############################################
+#             $APP_NAME CLI
+#############################################
+
+# TODO:
+# - Dependencies validation
+# - Arguments validation
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="${SCRIPT_DIR%/}/.."
+PLUGIN_DIR="${ROOT_DIR%/}/commands"
+LIB_DIR="${ROOT_DIR%/}/lib"
+LOG_DIR="${ROOT_DIR%/}/logs"
+
+source "${LIB_DIR}/colors.sh"
+source "${LIB_DIR}/logging.sh"
+source "${LIB_DIR}/aws.sh"
+source "${LIB_DIR}/utils.sh"
+source "${LIB_DIR}/validation.sh"
+
+COMMANDS=()
+COMMAND_FUNCS=()
+COMMAND_DESCS=()
+
+register_command() {
+  local name="$1"
+  local func="$2"
+  local desc="${3:-}"
+
+  COMMANDS+=("$name")
+  COMMAND_FUNCS+=("$func")
+  COMMAND_DESCS+=("$desc")
+}
+
+list_commands() {
+  local i
+
+  for (( i=0; i<${#COMMANDS[@]}; i++ )); do
+    local name="${COMMANDS[$i]}"
+    local desc="${COMMAND_DESCS[$i]}"
+
+    printf "  ${GREEN}%-15s${RESET} %s\n" "$name" "$desc"
+  done
+}
+
+load_commands() {
+  if [[ -d "$PLUGIN_DIR" ]]; then
+    for plugin in "$PLUGIN_DIR"/*.sh; do
+      [[ -e "$plugin" ]] || continue
+      source "$plugin"
+    done
+  fi
+}
+
+show_usage() {
+  echo "--------------------------"
+  echo "|      $APP_NAME CLI     |"
+  echo "--------------------------"
+  echo
+  echo -e "${YELLOW}Usage:${RESET}"
+  echo "  command [options] [arguments]"
+  echo
+  echo -e "${YELLOW}Options:${RESET}"
+  printf "  ${GREEN}%-15s${RESET} %s\n" " -h, --help" "Display this help message"
+  echo
+  echo -e "${YELLOW}Available commands:${RESET}"
+
+  list_commands
+
+  echo
+  exit 0
+}
+
+load_commands
+
+if [[ $# -lt 1 ]]; then
+  show_usage
+fi
+
+COMMAND="$1"
+shift || true
+
+dispatch_command() {
+  i=0
+  found=0
+
+  while [[ $i -lt ${#COMMANDS[@]} ]]; do
+    if [[ "$COMMAND" == "${COMMANDS[$i]}" ]]; then
+      found=1
+      "${COMMAND_FUNCS[$i]}" "$@"
+      break;
+    fi
+
+    i=$(( i + 1 ))
+  done
+
+  if [[ $found -eq 0 ]]; then
+    show_usage
+  fi
+}
+
+dispatch_command "$@"

@@ -1,0 +1,10 @@
+# local .terraform directories
+.terraform/
+
+# local terraform state files
+*.tfstate
+*.tfstate.*
+
+# local terraform variables files
+*.tfvars
+!*.tfvars.example

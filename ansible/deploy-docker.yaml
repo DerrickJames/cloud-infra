@@ -1,0 +1,231 @@
+---
+- name: Install Docker
+  hosts: aws_ec2
+  become: yes
+  tasks:
+    - name: Install Docker and Python packages
+      dnf:
+        name:
+          - docker
+          - python3
+          - python3-pip
+          - cronie
+          - logrotate
+        update_cache: yes
+        state: present
+
+    - name: Start and enable Docker daemon
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Start and enable cron service
+      systemd:
+        name: crond
+        state: started
+        enabled: yes
+
+    - name: Add ec2-user to Docker group
+      user:
+        name: ec2-user
+        groups: docker
+        append: yes
+  
+    - name: Reconnect to server session to apply group membership changes
+      meta: reset_connection
+
+- name: Install Python Docker SDK
+  hosts: aws_ec2
+  become: yes
+  become_user: ec2-user
+  tasks:
+    - name: Install Docker Python module
+      pip:
+        name: docker
+
+- name: Manage Docker network and container with rolling deployment
+  hosts: aws_ec2
+  become: yes
+  tasks:
+    - name: Create a Docker network
+      docker_network:
+        name: appName
+        driver: bridge
+
+    - name: Docker login
+      docker_login:
+        registry_url: ghcr.io
+        username: "{{ docker_username }}"
+        password: "{{ docker_password }}"
+
+    - name: Ensure the latest image is pulled
+      docker_image:
+        name: "{{ docker_image }}"
+        source: pull
+      register: image_info
+
+    - name: Find all containers matching a pattern
+      docker_host_info:
+        containers: true
+        containers_filters:
+          name: "appName"
+      register: matching_containers
+
+    - name: Print Matching Containers information
+      debug:
+        var: matching_containers
+
+    - name: Get currently running application container name
+      set_fact:
+        currently_running_container_name: "{{ matching_containers.containers[0].Names[0] if matching_containers.containers[0] is defined else False  }}"
+
+    - name: Get currently running application container info
+      docker_container_info:
+        name: "{{ currently_running_container_name }}"
+      register: current_container_info
+      ignore_errors: true
+
+    - name: Print Image Information
+      debug:
+        var: image_info
+
+    - name: Print Current Container Information
+      debug:
+        var: current_container_info
+
+    - name: Check if the application container is running the latest image
+      set_fact:
+        container_up_to_date: "{{ current_container_info.container.Image == image_info.image.Id if current_container_info.container.Image is defined else False }}"
+
+    - name: Stop playbook if latest image is running
+      fail:
+        msg: ">>> Most recent image is already in use"
+      when: container_up_to_date
+
+    - name: Generate a unique application container name
+      set_fact:
+        app_container_name: "appName{{ ansible_date_time.epoch }}"
+
+    - name: Start appName app and attach it to the network
+      docker_container:
+        name: "{{ app_container_name }}"
+        image: "{{ docker_image }}"
+        state: started
+        restart_policy: always
+        networks:
+          - name: appName
+
+    - name: Wait for processes to boot up
+      pause:
+        seconds: 5
+
+    - name: Get currently running nginx container info
+      docker_container_info:
+        name: nginx
+      register: current_nginx_info
+      ignore_errors: true
+
+    - name: Print Current Nginx Container Information
+      debug:
+        var: current_nginx_info
+
+    - name: Check if there is an nginx container instance running
+      set_fact:
+        nginx_container_up_to_date: "{{ current_nginx_info.container.State and current_nginx_info.container.State.Status == 'running' if current_nginx_info.container.State is defined else False }}"
+
+    - name: Copy nginx config directory
+      copy:
+        src: conf.d
+        dest: /opt/
+      when: not nginx_container_up_to_date
+
+    - name: Update Nginx upstream with the new container
+      lineinfile:
+        path: /opt/conf.d/default.conf
+        regexp: "server appName.*;"
+        line: "server {{ app_container_name }}:80;"
+        state: present
+
+    - name: Start Nginx and attach it to the network
+      docker_container:
+        name: nginx
+        image: nginx:alpine
+        restart_policy: "always"
+        networks:
+          - name: appName
+        volumes:
+          - /opt/conf.d:/etc/nginx/conf.d
+        published_ports:
+          - "80:80"
+      when: not nginx_container_up_to_date
+
+    - name: Test Nginx configuration
+      community.docker.docker_container_exec:
+        container: nginx
+        command: nginx -t
+      register: nginx_test
+      when: nginx_container_up_to_date
+
+    - name: Gracefully reload Nginx by sending HUP signal
+      community.docker.docker_container_exec:
+        container: nginx
+        command: kill -HUP 1
+      when: nginx_test.rc is defined and nginx_test.rc == 0
+
+    - name: Get new app container info
+      docker_container_info:
+        name: "{{ app_container_name }}"
+      register: new_container_info
+
+    - name: Ensure reminders log file exists
+      file:
+        path: /var/log/skill_actions_reminders.log
+        state: touch
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Configure cron for skill actions reminders (runs every 30 minutes)
+      cron:
+        name: "skill_actions_reminders"
+        user: root
+        minute: "*/30"
+        job: >-
+          docker exec -w /var/www/html {{ app_container_name }}
+          ./vendor/bin/laminas reminders:send-skill-actions
+          >> /var/log/skill_actions_reminders.log 2>&1
+      when: new_container_info.container.State.Status == "running"
+
+    - name: Configure logrotate for skill actions reminders log
+      copy:
+        dest: /etc/logrotate.d/skill_actions_reminders
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          /var/log/skill_actions_reminders.log {
+            daily
+            rotate 2
+            compress
+            missingok
+            notifempty
+            create 0644 root root
+            sharedscripts
+          }
+        
+    - name: Stop the older container instance
+      docker_container:
+        name: "{{ currently_running_container_name | regex_replace('^/', '') }}"
+        state: absent
+        cleanup: yes
+      when:
+        - currently_running_container_name is truthy
+        - currently_running_container_name != app_container_name
+        - nginx_test is not defined or nginx_test.rc == 0
+
+    - name: Remove dangling images
+      docker_prune:
+        images: true
+        images_filters:
+          dangling: yes

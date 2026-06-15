@@ -1,0 +1,5 @@
+bucket         = "appName-staging-terraform-state"
+key            = "appName/bootstrap/backend/terraform.tfstate"
+region         = "us-west-2"
+dynamodb_table = "appName-terraform-state-locks"
+encrypt        = true

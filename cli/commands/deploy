@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+
+########################################################
+#
+# Get info on currently running "appName" container
+#
+APP_CONTAINER=$(docker ps -a -q --filter="name=appName")
+NEW_CONTAINER="appName`date +"%s"`"
+
+########################################################
+#
+# Deploy a new container
+#
+
+# Get registry credentials from SSM Parameter Store SecureString
+ssm_get_parameter() {
+  local name="$1"
+  aws ssm get-parameter --name "$name" --with-decryption --query Parameter.Value --output text
+}
+
+GC_REGISTRY_USERNAME=$(ssm_get_parameter "/appName/ghcr/username")
+GC_REGISTRY_TOKEN=$(ssm_get_parameter "/appName/ghcr/token")
+echo "$GC_REGISTRY_TOKEN" | docker login ghcr.io -u "$GC_REGISTRY_USERNAME" --password-stdin
+
+# Pull latest
+docker pull ghcr.io/organization/appName
+
+# Don't deploy if latest image is running
+RUNNING_IMAGE=$(docker inspect $APP_CONTAINER | jq ".[0].Image")
+CURRENT_IMAGE=$(docker image inspect ghcr.io/organization/appName:latest | jq ".[0].Id")
+
+if [ "$CURRENT_IMAGE" == "$RUNNING_IMAGE" ]; then
+    echo ">>> Most recent image is already in use"
+    exit 0
+fi
+
+# Start new instance
+NEW_APP_CONTAINER=$(docker run -d --network=appName --restart=always --name="$NEW_CONTAINER" ghcr.io/organization/appName)
+
+# Wait for processes to boot up
+sleep 5
+
+echo "Started new container $NEW_APP_CONTAINER"
+
+# Update Nginx
+sudo sed -i "s/server appName.*/server $NEW_CONTAINER:80;/" /opt/conf.d/default.conf
+
+# Configtest Nginx
+docker exec nginx nginx -t
+NGINX_STABLE=$?
+
+if [ $NGINX_STABLE -eq 0 ]; then
+    # Reload Nginx
+    docker kill -s HUP nginx
+
+    # Stop older instance
+    docker stop $APP_CONTAINER
+    docker rm -v $APP_CONTAINER
+    echo "Removed old container $APP_CONTAINER"
+
+    # Cleanup, if any dangling images
+    DANGLING_IMAGES=$(docker image ls -f "dangling=true" -q)
+    if [ ! -z "$DANGLING_IMAGES" ]; then
+        docker image rm $(docker image ls -f "dangling=true" -q)
+    fi
+
+
+else
+    echo "ERROR: Nginx configuration test failed!"
+    exit 1
+fi
